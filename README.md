@@ -1,0 +1,2 @@
+# DingtalkStreamPushForward
+简单的转发来自钉钉Stream推送的消息，实现事件回调多播，机器人消息不受随机网关推送影响
