@@ -27,7 +27,7 @@ jobs:
         echo Add other actions to build,
         echo test, and deploy your project.
         docker run -v $GITHUB_WORKSPACE:/src cdrx/pyinstaller-windows:latest 'pyinstaller -F --clean -y --dist ./ --workpath /tmp main.py'
-        zip -r $GITHUB_WORKSPACE/test2.zip $GITHUB_WORKSPACE/test2.exe
+        zip -r $GITHUB_WORKSPACE/test2.zip $GITHUB_WORKSPACE/main.exe
     - name: Create Release
       id: create_release
       uses: actions/create-release@v1
