@@ -30,16 +30,11 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.completion import NestedCompleter
 from concurrent.futures import ThreadPoolExecutor
-
-from pydantic import BaseModel
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.pretty import pretty_repr, Pretty
 from rich.table import Table
 import logging
-import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
 AppKey = ""
 AppSecret = ""
@@ -51,7 +46,7 @@ max_retry_times = 2
 retry_delay = 3
 extra_header = {}
 http_urls = []
-host, port = '127.0.0.1', 0
+host, port = '0.0.0.0', 0
 websockets_list: List[web.WebSocketResponse] = []
 websocket_verify_headers = "DingtalkStreamPushForward"
 not_count_events = [
@@ -73,10 +68,9 @@ not_count_events = [
     "org_annual_certification_submission"
 ]
 now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-requestUserAgent = f"DingtalkStreamPushForward v0.1 created on {now} (+https://github.com/MeiHuaGuangShuo/)"
+requestUserAgent = f"DingtalkStreamPushForward v1.0 created on {now} (+https://github.com/MeiHuaGuangShuo/DingtalkStreamPushForward)"
 WS_CONNECT_URL = "https://api.dingtalk.com/v1.0/gateway/connections/open"
 prepared = False
-fastapi_app = FastAPI()
 stream_checker = collections.deque([], 50)
 allow_tickets = []
 websocket_times = [0, 0, 0]
@@ -90,19 +84,19 @@ logging.basicConfig(
 logger = logging.getLogger('rich')
 
 
-class StreamRequest(BaseModel):
-    clientId: str
-    clientSecret: str
-    
-
-@fastapi_app.post("/v1.0/gateway/connections/open")
-def request_connection(r: StreamRequest):
-    if AppKey == r.clientId and AppSecret == r.clientSecret:
+async def request_connection(request: web.Request):
+    clientIp = request.headers.get("CF-Connecting-IP", request.remote)
+    d = await request.json()
+    if AppKey == d.get("clientId") and AppSecret == d.get("clientSecret"):
         ticket = str(uuid.uuid1())
         allow_tickets.append(ticket)
-        return JSONResponse({'endpoint': f"ws://{host}:{port}/", 'ticket': ticket})
+        if clientIp in ["0.0.0.0", "127.0.0.1", "::1"]:
+            connect_host = "localhost"
+        else:
+            connect_host = get_local_ip()
+        return web.json_response({'endpoint': f"ws://{connect_host}:{port}/", 'ticket': ticket})
     else:
-        return JSONResponse({'reason':"Auth failed.", 'code': 401}, status_code=401)
+        return web.json_response({'reason': "Auth failed.", 'code': 401}, status=401)
 
 
 def get_local_ip():
@@ -139,7 +133,7 @@ def decrypt(encrypt_data, aes_key):
 def encrypt(data, token, aesKey, appKey, timestamp=None, nonce=None):
     aesKey = base64.b64decode(aesKey + '=')
     if timestamp is None:
-        timestamp = str(int(time.time()*1000))
+        timestamp = str(int(time.time() * 1000))
     if isinstance(timestamp, int):
         timestamp = str(timestamp)
     if nonce is None:
@@ -230,11 +224,14 @@ async def route_message(json_message: dict, websocket: websockets.WebSocketServe
                     not_commit = True
                 else:
                     try:
-                        is_exist = counter.execute(f"SELECT * FROM `events` WHERE event_type='{headers['eventType']}'", result=True)
+                        is_exist = counter.execute(f"SELECT * FROM `events` WHERE event_type='{headers['eventType']}'",
+                                                   result=True)
                         if is_exist:
-                            counter.execute(f"UPDATE `events` SET times=times+1 WHERE event_type='{headers['eventType']}';")
+                            counter.execute(
+                                f"UPDATE `events` SET times=times+1 WHERE event_type='{headers['eventType']}';")
                         else:
-                            counter.execute(f"INSERT INTO `events` (event_type, times) VALUES ('{headers['eventType']}', 1);")
+                            counter.execute(
+                                f"INSERT INTO `events` (event_type, times) VALUES ('{headers['eventType']}', 1);")
                         counter.db.commit()
                     except:
                         console.print_exception(show_locals=True)
@@ -246,7 +243,8 @@ async def route_message(json_message: dict, websocket: websockets.WebSocketServe
                 'message': 'OK',
                 'data'   : json_message['data'],
             }))
-        counter.execute(f"INSERT INTO `received` (data, TimeStamp) VALUES (?, ?)", (json.dumps(json_message), int(time.time()*1000)))
+        counter.execute(f"INSERT INTO `received` (data, TimeStamp) VALUES (?, ?)",
+                        (json.dumps(json_message), int(time.time() * 1000)))
         if not not_commit:
             now_date = "Received_" + datetime.datetime.now().strftime("%Y_%m")
             is_exist = counter.execute(f"SELECT * FROM `counts` WHERE name='{now_date}'", result=True)
@@ -260,7 +258,7 @@ async def route_message(json_message: dict, websocket: websockets.WebSocketServe
                 all_times = all_times[0][0]
             is_exist = counter.execute(f"SELECT * FROM `counts` WHERE name='{now_date}'", result=True)
             websocket_times = [websocket_times[0] + 1, is_exist[0][1] if is_exist else 0, all_times]
-        
+    
     except Exception:
         console.print_exception(show_locals=True)
     return result
@@ -330,8 +328,9 @@ async def bcc(raw, data):
                 url = str(u[0])
                 try:
                     tried = 0
-                    curr_time = str(int(time.time()*1000))
-                    enc_data = encrypt(json.dumps(new_data), Token, AesKey, u[1], curr_time, force_nonce if force_nonce else None)
+                    curr_time = str(int(time.time() * 1000))
+                    enc_data = encrypt(json.dumps(new_data), Token, AesKey, u[1], curr_time,
+                                       force_nonce if force_nonce else None)
                     data = {'encrypt': enc_data['encrypt']}
                     url_param['signature'] = enc_data['msg_signature']
                     url_param['msg_signature'] = enc_data['msg_signature']
@@ -350,7 +349,8 @@ async def bcc(raw, data):
                         resp = await res.text()
                         if url_param:
                             try:
-                                if res.headers.get('Content-Type') == 'application/json' and resp.startswith('{') and 'encrypt' in resp:
+                                if res.headers.get('Content-Type') == 'application/json' and resp.startswith(
+                                        '{') and 'encrypt' in resp:
                                     resp = await res.json()
                                     if (dec_mes := decrypt(resp['encrypt'], AesKey)) == 'success':
                                         re_enc = encrypt('success', Token, AesKey, u[1], resp.get('timeStamp'),
@@ -360,11 +360,14 @@ async def bcc(raw, data):
                                                 f"Push url:\n> {u[0]}\nStatus [{res.status}]:\n> {pretty_repr(await res.text())}")
                                             tried = max_retry_times
                                             try:
-                                                is_exist = counter.execute(f"SELECT * FROM `webhooks` WHERE url=?", (u[0],), result=True)
+                                                is_exist = counter.execute(f"SELECT * FROM `webhooks` WHERE url=?",
+                                                                           (u[0],), result=True)
                                                 if is_exist:
-                                                    counter.execute(f"UPDATE `webhooks` SET times=times+1 WHERE url=?;", (u[0],))
+                                                    counter.execute(f"UPDATE `webhooks` SET times=times+1 WHERE url=?;",
+                                                                    (u[0],))
                                                 else:
-                                                    counter.execute(f"INSERT INTO `webhooks` (url, times) VALUES (?, 1);", (u[0],))
+                                                    counter.execute(
+                                                        f"INSERT INTO `webhooks` (url, times) VALUES (?, 1);", (u[0],))
                                                 counter.db.commit()
                                             except:
                                                 console.print_exception(show_locals=True)
@@ -393,9 +396,10 @@ async def bcc(raw, data):
                                 tried += 1
                                 continue
                             except UnicodeDecodeError:
-                                logger.error(f"[red]Error Callback Result[/]: [white bold]Wrong AesKey Callback Reply[/]\n"
-                                             f"URL: {u}\nPostData: {data}\n"
-                                             f"Result:\n  {pretty_repr(resp)}")
+                                logger.error(
+                                    f"[red]Error Callback Result[/]: [white bold]Wrong AesKey Callback Reply[/]\n"
+                                    f"URL: {u}\nPostData: {data}\n"
+                                    f"Result:\n  {pretty_repr(resp)}")
                                 await asyncio.sleep(retry_delay)
                                 tried += 1
                                 continue
@@ -430,9 +434,8 @@ async def websocket_send(data):
 async def handle_websocket(request: web.Request):
     global websockets_list
     request_headers = request.headers
-    auth = request_headers.get("Auth")
     ticket = request.query.get('ticket', '')
-    clientIp = request_headers.get("CF-CONNECT-IP", request.remote)
+    clientIp = request_headers.get("CF-Connecting-IP", request.remote)
     logger.info(f"Connect Request from {clientIp}")
     if ticket not in allow_tickets:
         logger.warning(f"{clientIp} Authentication failed. Headers: {request_headers}")
@@ -447,7 +450,8 @@ async def handle_websocket(request: web.Request):
             try:
                 message = json.loads(message.data)
             except Exception as err:
-                logger.error(f'Invalid Response.\n{err.__class__.__name__}: {err}\nClient: {clientIp}\nMessage:\n>{pretty_repr(message)}')
+                logger.error(
+                    f'Invalid Response.\n{err.__class__.__name__}: {err}\nClient: {clientIp}\nMessage:\n>{pretty_repr(message)}')
                 await websocket.close(code=1008, message=b'Invalid Response.')
                 break
             else:
@@ -520,7 +524,7 @@ def main():
             elif command == 'close_websocket':
                 for ws in websockets_list:
                     try:
-                        asyncio.run(ws.close(1000))
+                        asyncio.run(ws.close(code=1000, message=b"Server closed."))
                     except Exception as err:
                         console.print(f"Err while closing websocket from {ws.remote_address[0]}\n"
                                       f"[bold red]{err.__class__.__name__}[/]: [white bold]{err}[/]")
@@ -554,7 +558,8 @@ def main():
                 for r in res:
                     t.add_row(*[Pretty(x) for x in r])
                 console.print(t)
-                res = counter.execute("SELECT * FROM `counts` WHERE name LIKE 'Received_%' ORDER BY name DESC;", result=True)
+                res = counter.execute("SELECT * FROM `counts` WHERE name LIKE 'Received_%' ORDER BY name DESC;",
+                                      result=True)
                 _all_times = counter.execute("SELECT SUM(times) FROM counts WHERE name LIKE 'Received_%'", result=True)
                 if _all_times:
                     _all_times = _all_times[0][0]
@@ -627,10 +632,6 @@ async def main_websocket():
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-    
-    
-def start_fastapi():
-    uvicorn.run(fastapi_app, host="localhost", port=12339)
 
 
 def stop(*args):
@@ -663,7 +664,8 @@ class Counter:
     
     @classmethod
     def get_tables(cls):
-        res = cls.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';", result=True)
+        res = cls.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';",
+                          result=True)
         return [x[0] for x in res]
     
     @classmethod
@@ -717,19 +719,19 @@ class Counter:
     @classmethod
     def init_tables(cls):
         to_tables = {
-            "webhooks"  : {
-                "url" : str,
+            "webhooks": {
+                "url": str,
                 "times": int
             },
-            "events": {
-                "event_type" : str,
-                "times": int
+            "events"  : {
+                "event_type": str,
+                "times"     : int
             },
             "received": {
-                "data" : str,
+                "data": str,
                 "TimeStamp": int
             },
-            "counts": {
+            "counts"  : {
                 "name" : str,
                 "times": int
             }
@@ -753,13 +755,13 @@ counter.init_tables()
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="简单的转发来自钉钉Stream推送的消息，实现事件回调多播,不受随机网关推送影响")
-    parser.add_argument("--app-key", type=str, help="Stream 模式下的 AppKey")
-    parser.add_argument("--app-secret", type=str, help="Stream 模式下的 AppSecret")
+    parser.add_argument("--app-key", "-k", type=str, help="Stream 模式下的 AppKey")
+    parser.add_argument("--app-secret", "-s", type=str, help="Stream 模式下的 AppSecret")
     parser.add_argument("--host", type=str, help="Stream 服务模式下的绑定域名")
     parser.add_argument("--port", "-p", type=int, help="Stream 服务模式下的要绑定的本地端口")
     parser.add_argument("--aes-key", type=str, help="HTTP 模式下的 AesKey")
     parser.add_argument("--token", type=str, help="HTTP 模式下的 Token")
-    parser.add_argument("--extra-header",  '-H', type=str, help="HTTP 模式下的额外 Header")
+    parser.add_argument("--extra-header", '-H', type=str, help="HTTP 模式下的额外 Header")
     parser.add_argument("--force-nonce", type=str, help="HTTP 模式下重试延迟")
     parser.add_argument("--disable-retry", action='store_true', help="HTTP 模式下不会重试")
     parser.add_argument("--max-retry-times", type=int, help="HTTP 模式下重试次数")
@@ -786,7 +788,8 @@ if __name__ == '__main__':
                     extra_header[header[0]] = header[1]
     if args.force_nonce:
         if (l := len(bytes(args.force_nonce, 'utf8'))) not in [8, 16]:
-            logger.warning(f"Forced nonce [red bold]{args.force_nonce}[/] is {l}b, not 8b/16b, it may cause some error.")
+            logger.warning(
+                f"Forced nonce [red bold]{args.force_nonce}[/] is {l}b, not 8b/16b, it may cause some error.")
         force_nonce = args.force_nonce
     if args.disable_retry:
         disable_retry = True
@@ -825,22 +828,26 @@ if __name__ == '__main__':
     if all_times:
         all_times = all_times[0][0]
     websocket_times = [0, is_exist[0][1] if is_exist else 0, all_times]
+    
+    
     def handle_async_exception(loop, context):
         if err := context.get('exception'):
             logger.error(f"{err.__class__.__name__}: {err}")
+    
+    
     with ThreadPoolExecutor() as pool:
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(handle_async_exception)
         stream_task = loop.create_task(main_stream())
         if port:
             app = web.Application()
-            app.add_routes([web.get('/', handle_websocket)])
+            app.add_routes(
+                [web.get('/', handle_websocket), web.post('/v1.0/gateway/connections/open', request_connection)])
             runner = web.AppRunner(app)
             # start_server = websockets.serve(handle_websocket, host, port)
             websocket_task = loop.create_task(main_websocket())
         else:
             websocket_task = None
-        fastapi_task = pool.submit(start_fastapi)
         pool.submit(main)
         loop.run_forever()
     logger.info("Stopped")
