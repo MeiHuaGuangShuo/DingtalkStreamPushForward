@@ -10,7 +10,6 @@ from IPython import embed
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from aiohttp import ClientSession, web
-import requests
 import socket
 import collections
 import hmac
@@ -86,14 +85,18 @@ logger = logging.getLogger('rich')
 
 async def request_connection(request: web.Request):
     clientIp = request.headers.get("CF-Connecting-IP", request.remote)
+    localIp = get_local_ip()
     d = await request.json()
     if AppKey == d.get("clientId") and AppSecret == d.get("clientSecret"):
         ticket = str(uuid.uuid1())
         allow_tickets.append(ticket)
-        if clientIp in ["0.0.0.0", "127.0.0.1", "::1"]:
-            connect_host = "localhost"
+        if host.replace(".", "").isnumeric():
+            if clientIp in ["0.0.0.0", "127.0.0.1", "::1", localIp]:
+                connect_host = "localhost"
+            else:
+                connect_host = localIp
         else:
-            connect_host = get_local_ip()
+            connect_host = host
         return web.json_response({'endpoint': f"ws://{connect_host}:{port}/", 'ticket': ticket})
     else:
         return web.json_response({'reason': "Auth failed.", 'code': 401}, status=401)
@@ -169,15 +172,16 @@ async def open_connection():
     logger.info(f'Requesting stream connection...\n'
                 f'Headers:\n{pretty_repr(request_headers)}\n'
                 f'Body:\n{pretty_repr(request_body)}')
-    response = requests.post(WS_CONNECT_URL, headers=request_headers, json=request_body)
-    http_body = response.json()
-    if not response.ok:
-        logger.error(f"Open connection failed, Reason: {response.reason}, Response: {http_body}")
-        if response.status_code == 401:
-            logger.warning(f"The AppKey or AppSecret maybe inaccurate")
-            sys.exit(1)
-        return None
-    return response.json()
+    async with ClientSession() as session:
+        async with session.post(WS_CONNECT_URL, headers=request_headers, json=request_body) as response:
+            http_body = await response.json()
+            if not response.ok:
+                logger.error(f"Open connection failed, Reason: {response.reason}, Response: {http_body}")
+                if response.status == 401:
+                    logger.warning(f"The AppKey or AppSecret maybe inaccurate")
+                    sys.exit(1)
+                return None
+            return http_body
 
 
 async def route_message(json_message: dict, websocket: websockets.WebSocketServer):
