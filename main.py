@@ -47,6 +47,7 @@ extra_header = {}
 http_urls = []
 host, port = '0.0.0.0', 0
 websockets_list: List[web.WebSocketResponse] = []
+websockets_connectionId_list: Dict[web.WebSocketResponse, str] = {}
 websocket_verify_headers = "DingtalkStreamPushForward"
 not_count_events = [
     "user_add_org",
@@ -84,14 +85,14 @@ logger = logging.getLogger('rich')
 
 
 async def request_connection(request: web.Request):
-    clientIp = request.headers.get("CF-Connecting-IP", request.remote)
+    clientIp = request.headers.get("CF-Connecting-IP", request.headers.get("X-Real-IP", request.remote))
     localIp = get_local_ip()
     d = await request.json()
     if AppKey == d.get("clientId") and AppSecret == d.get("clientSecret"):
         ticket = str(uuid.uuid1())
         allow_tickets.append(ticket)
         if host.replace(".", "").isnumeric():
-            if clientIp in ["0.0.0.0", "127.0.0.1", "::1", localIp]:
+            if clientIp in ["0.0.0.0", "127.0.0.1", "::1", localIp] + get_local_ipv6():
                 connect_host = "localhost"
             else:
                 connect_host = localIp
@@ -114,6 +115,78 @@ def get_local_ip():
     return ip
 
 
+def get_local_ipv6() -> list:
+    r = socket.getaddrinfo(socket.gethostname(), 80, socket.AF_INET6)
+    ips = []
+    for i in r:
+        ips.append(i[4][0])
+    return ips
+
+
+async def webhook_handler(request: web.Request):
+    if stream_task:
+        return web.json_response({"success": False, "reason": "WebHook not enabled"}, status=400)
+    # headers = request.headers
+    if not request.body_exists:
+        return web.json_response({"success": False, "reason": "Request does not valid"}, status=400)
+    data = await request.json()
+    logger.info(pretty_repr(data))
+    send_json = {
+        "specVersion": "1.0",
+        "type"       : "CALLBACK",
+        "headers"    : {
+            "appId"      : str(uuid.uuid3(uuid.NAMESPACE_OID, AppKey)),
+            "contentType": "application/json",
+            "messageId"  : str(uuid.uuid4()).replace("-", "_"),
+            "time"       : str(int(time.time() * 1000)),
+            "topic"      : "*"
+        },
+        "data"       : ""
+    }
+    if "encrypt" in data:
+        send_json["type"] = "EVENT"
+        send_json["headers"] = {
+            "appId"            : str(uuid.uuid3(uuid.NAMESPACE_OID, AppKey)),
+            "contentType"      : "application/json",
+            "eventCorpId"      : AppKey,
+            "eventId"          : str(uuid.uuid4()).replace("-", ""),
+            "eventType"        : "chat_update_title",
+            "eventUnifiedAppId": str(uuid.uuid3(uuid.NAMESPACE_OID, AppKey)),
+            "messageId"        : str(uuid.uuid4()).replace("-", "_"),
+            "time"             : str(int(time.time() * 1000)),
+            "topic"            : "*"
+        }
+        try:
+            event = decrypt(data.get("encrypt"), AesKey)
+        except json.JSONDecodeError:
+            logger.error("无法解密，请检查配置的事件回调密钥")
+            return web.json_response({"success": False, "reason": "AesKey does not match"}, status=500)
+        except Exception as err:
+            logger.exception(err)
+            return web.json_response({"success": False, "reason": "AesKey does not match"}, status=500)
+        if event is None:
+            logger.error("解密后消息为空，请检查配置的事件回调密钥")
+            return web.json_response({"success": False, "reason": "Empty data"}, status=500)
+        event = json.loads(event)
+        send_json["headers"]["eventType"] = event.get("EventType", "unknown_event")
+        send_json["headers"]["eventBornTim"] = event.get("TimeStamp", str(int(time.time() * 1000)))
+        data = {}
+        for k, v in event.items():
+            if not k:
+                continue
+            if not isinstance(k, str):
+                data[k] = v
+            if len(k) == 1:
+                data[k] = v
+            else:
+                data[k[0].lower() + k[1:]] = v
+    send_json["data"] = json.dumps(data)
+    loop.create_task(bcc(send_json, data))
+    return web.json_response(sign_js())
+        
+        
+
+
 def generate_signature(timestamp, appSecret):
     signature_string = str(timestamp) + "\n" + appSecret
     signature = hmac.new(appSecret.encode(), signature_string.encode(), hashlib.sha256)
@@ -131,6 +204,10 @@ def decrypt(encrypt_data, aes_key):
     msg_len = int.from_bytes(decrypted_data[:4], byteorder="big")
     msg = decrypted_data[4:4 + msg_len]
     return msg.decode()
+
+
+def sign_js():
+    return encrypt("success", Token, AesKey, AppKey)
 
 
 def encrypt(data, token, aesKey, appKey, timestamp=None, nonce=None):
@@ -423,13 +500,17 @@ async def bcc(raw, data):
 
 async def websocket_send(data):
     global websockets_list
+    global websockets_connectionId_list
     for w in websockets_list:
         try:
+            if "headers" in data:
+                data['headers']['connectionId'] = websockets_connectionId_list[w]
             await w.send_json(data)
         except Exception:
             console.print_exception(max_frames=2, show_locals=True)
             try:
                 websockets_list.remove(w)
+                websockets_connectionId_list.pop(w)
                 await w.close()
             except:
                 pass
@@ -437,18 +518,20 @@ async def websocket_send(data):
 
 async def handle_websocket(request: web.Request):
     global websockets_list
-    request_headers = request.headers
+    global websockets_connectionId_list
+    request_headers = dict(request.headers)
     ticket = request.query.get('ticket', '')
     clientIp = request_headers.get("CF-Connecting-IP", request.remote)
     logger.info(f"Connect Request from {clientIp}")
     if ticket not in allow_tickets:
-        logger.warning(f"{clientIp} Authentication failed. Headers: {request_headers}")
+        logger.warning(f"{clientIp} Authentication failed. Headers: {request_headers} Ticket: {ticket}")
         return web.Response(status=400)
     allow_tickets.remove(ticket)
     websocket = web.WebSocketResponse()
     await websocket.prepare(request)
     logger.info(f"{clientIp} Connected.")
     websockets_list.append(websocket)
+    websockets_connectionId_list[websocket] = str(uuid.uuid4())
     try:
         async for message in websocket:
             try:
@@ -485,6 +568,7 @@ def get_prompt():
 
 def main():
     global websocket_task
+    global stream_task
     session = PromptSession(history=FileHistory('history.txt'),
                             auto_suggest=AutoSuggestFromHistory())
     completer = NestedCompleter.from_nested_dict({
@@ -500,7 +584,8 @@ def main():
         'eval'             : None,
         'ipython'          : None,
         'exit'             : None,
-        'stop'             : None
+        'stop': None,
+        "mode": {"webhook": None, "stream": None, "switch": None},
     })
     while ...:
         try:
@@ -625,6 +710,32 @@ def main():
             elif command.startswith('sql '):
                 res = counter.execute(command.split(' ', 1)[1], result=True)
                 console.print(res)
+            elif command.startswith('mode '):
+                mode = command.split(" ", 1)
+                if len(mode) != 2:
+                    logger.error("Wrong mode")
+                else:
+                    if mode[1] == "webhook":
+                        if stream_task:
+                            stream_task.cancel()
+                            stream_task = None
+                            logger.info("Switched mode to WebHook")
+                        else:
+                            logger.warning("Current mode was WebHook, not changed.")
+                    elif mode[1] == "stream":
+                        if stream_task:
+                            logger.warning("Current mode was Stream, not changed.")
+                        else:
+                            stream_task = loop.create_task(main_stream())
+                            logger.info("Switched mode to Stream")
+                    else:
+                        if stream_task:
+                            stream_task.cancel()
+                            stream_task = None
+                            logger.info("Switched mode to WebHook")
+                        else:
+                            stream_task = loop.create_task(main_stream())
+                            logger.info("Switched mode to Stream")
             else:
                 console.print(f"Unknown command: {command}")
         except Exception:
@@ -639,7 +750,8 @@ async def main_websocket():
 
 
 def stop(*args):
-    stream_task.cancel()
+    if stream_task:
+        stream_task.cancel()
     if websocket_task:
         websocket_task.cancel()
     loop.stop()
@@ -770,6 +882,7 @@ if __name__ == '__main__':
     parser.add_argument("--disable-retry", action='store_true', help="HTTP 模式下不会重试")
     parser.add_argument("--max-retry-times", type=int, help="HTTP 模式下重试次数")
     parser.add_argument("--retry-delay", type=int, help="HTTP 模式下重试延迟")
+    parser.add_argument("--webhook", action='store_true', help="WebHook 模式")
     args = parser.parse_args()
     if args.app_key:
         AppKey = args.app_key
@@ -842,12 +955,19 @@ if __name__ == '__main__':
     with ThreadPoolExecutor() as pool:
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(handle_async_exception)
-        stream_task = loop.create_task(main_stream())
+        stream_task = None
+        if not args.webhook:
+            stream_task = loop.create_task(main_stream())
+        app = web.Application()
+        app.add_routes(
+            [
+                web.get('/', handle_websocket),
+                web.post('/v1.0/gateway/connections/open', request_connection),
+                web.post('/', webhook_handler)
+            ]
+        )
+        runner = web.AppRunner(app)
         if port:
-            app = web.Application()
-            app.add_routes(
-                [web.get('/', handle_websocket), web.post('/v1.0/gateway/connections/open', request_connection)])
-            runner = web.AppRunner(app)
             # start_server = websockets.serve(handle_websocket, host, port)
             websocket_task = loop.create_task(main_websocket())
         else:
