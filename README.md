@@ -28,7 +28,8 @@ WebhookUrl AppKey
 **注意：程序包含验证(强验证，要求再加密内容完全一致)，若验证不通过则会自动重试，可用通过参数 --disable-retry 关闭重试**
 
 ## Stream 链接方法
-和钉钉验证一样，POST相同的 `AppKey` `AppSecret` 到 `localhost:12339/v1.0/gateway/connections/open` 来获取地址和URL请求
+
+和钉钉验证一样，POST相同的 `AppKey` `AppSecret` 到 `localhost:12340/v1.0/gateway/connections/open` 来获取地址和URL请求
 
 注意：若 `host` 参数使用的是如 `127.0.0.1` 的地址，返回的也会是 `wss://127.0.0.1:12340?ticket=***`
 
