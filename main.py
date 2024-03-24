@@ -82,6 +82,34 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True, markup=True)]
 )
 logger = logging.getLogger('rich')
+INTRODUCE_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>DingtalkStreamPushForward</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding: 50px;
+    }
+    h1 {
+      font-size: 28px;
+      margin-bottom: 20px;
+    }
+    p {
+      font-size: 18px;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1><a href="https://github.com/MeiHuaGuangShuo/DingtalkStreamPushForward">DingtalkStreamPushForward</a></h1>
+  <p>是一个能转发HTTP或Stream消息的微型Python客户端，可以轻易实现多客户端同时接受消息</p>
+</body>
+</html>
+"""
 
 
 async def request_connection(request: web.Request):
@@ -126,7 +154,11 @@ def get_local_ipv6() -> list:
 async def webhook_handler(request: web.Request):
     if stream_task:
         return web.json_response({"success": False, "reason": "WebHook not enabled"}, status=400)
-    # headers = request.headers
+    headers = request.headers
+    if not headers:
+        return web.json_response({"success": False, "reason": "Headers does not valid"}, status=400)
+    if "http" in headers.get("User-Agent", '') or "Mozilla" in headers.get("User-Agent", ''):
+        return web.Response(text=INTRODUCE_HTML, content_type='text/html')
     if not request.body_exists:
         return web.json_response({"success": False, "reason": "Request does not valid"}, status=400)
     data = await request.json()
@@ -169,7 +201,7 @@ async def webhook_handler(request: web.Request):
             return web.json_response({"success": False, "reason": "Empty data"}, status=500)
         event = json.loads(event)
         send_json["headers"]["eventType"] = event.get("EventType", "unknown_event")
-        send_json["headers"]["eventBornTim"] = event.get("TimeStamp", str(int(time.time() * 1000)))
+        send_json["headers"]["eventBornTime"] = event.get("TimeStamp", str(int(time.time() * 1000)))
         data = {}
         for k, v in event.items():
             if not k:
@@ -183,7 +215,6 @@ async def webhook_handler(request: web.Request):
     send_json["data"] = json.dumps(data)
     loop.create_task(bcc(send_json, data))
     return web.json_response(sign_js())
-        
         
 
 
@@ -521,6 +552,11 @@ async def handle_websocket(request: web.Request):
     global websockets_connectionId_list
     request_headers = dict(request.headers)
     ticket = request.query.get('ticket', '')
+    if not request_headers:
+        return web.json_response({"success": False, "reason": "Headers does not valid"}, status=400)
+    if ("http" in request_headers.get("User-Agent", '') or "Mozilla" in request_headers.get("User-Agent",
+                                                                                            '')) and not ticket:
+        return web.Response(text=INTRODUCE_HTML, content_type='text/html')
     clientIp = request_headers.get("CF-Connecting-IP", request.remote)
     logger.info(f"Connect Request from {clientIp}")
     if ticket not in allow_tickets:
